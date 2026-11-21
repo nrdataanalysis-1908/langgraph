@@ -2983,3 +2983,105 @@ async def test_pregel_user_raised_cancellederror_fails_run():
     with pytest.raises(NodeCancelledError) as excinfo:
         await graph.ainvoke({"vals": []})
     assert excinfo.value.node == "boom"
+
+
+def test_retry_reuses_completed_task_after_node_retry() -> None:
+    """A node retry must reuse a completed @task under the original task ID."""
+    recorded: list[str] = []
+    attempts = 0
+
+    @task
+    def allocate() -> str:
+        allocated = f"id-{len(recorded)}"
+        recorded.append(allocated)
+        return allocated
+
+    class State(TypedDict):
+        value: str
+
+    def node(state: State) -> dict:
+        nonlocal attempts
+        allocated = allocate().result()
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("retry")
+        interrupt(allocated)
+        return {"value": allocated}
+
+    graph = (
+        StateGraph(State)
+        .add_node(
+            "node",
+            node,
+            retry_policy=RetryPolicy(
+                max_attempts=2,
+                initial_interval=0,
+                jitter=False,
+                retry_on=RuntimeError,
+            ),
+        )
+        .add_edge(START, "node")
+        .add_edge("node", END)
+        .compile(checkpointer=InMemorySaver())
+    )
+    config = {"configurable": {"thread_id": "retry-reuses-completed-task"}}
+
+    paused = graph.invoke({"value": ""}, config)
+    assert recorded == ["id-0"]
+    assert paused["__interrupt__"][0].value == "id-0"
+
+    resumed = graph.invoke(Command(resume=True), config)
+    assert resumed["value"] == "id-0"
+    assert recorded == ["id-0"]
+
+
+@pytest.mark.anyio
+async def test_async_retry_reuses_completed_task_after_node_retry() -> None:
+    """The async runner must preserve completed @task identity across retries."""
+    recorded: list[str] = []
+    attempts = 0
+
+    @task
+    async def allocate() -> str:
+        allocated = f"id-{len(recorded)}"
+        recorded.append(allocated)
+        return allocated
+
+    class State(TypedDict):
+        value: str
+
+    async def node(state: State) -> dict:
+        nonlocal attempts
+        allocated = await allocate()
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("retry")
+        interrupt(allocated)
+        return {"value": allocated}
+
+    graph = (
+        StateGraph(State)
+        .add_node(
+            "node",
+            node,
+            retry_policy=RetryPolicy(
+                max_attempts=2,
+                initial_interval=0,
+                jitter=False,
+                retry_on=RuntimeError,
+            ),
+        )
+        .add_edge(START, "node")
+        .add_edge("node", END)
+        .compile(checkpointer=InMemorySaver())
+    )
+    config = {"configurable": {"thread_id": "async-retry-reuses-completed-task"}}
+
+    paused = await graph.ainvoke({"value": ""}, config)
+    assert recorded == ["id-0"]
+    assert paused["__interrupt__"][0].value == "id-0"
+
+    resumed = await graph.ainvoke(Command(resume=True), config)
+    assert resumed["value"] == "id-0"
+    assert recorded == ["id-0"]
+
